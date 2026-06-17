@@ -28,31 +28,79 @@ from pymongo import MongoClient
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 
-client = MongoClient("localhost", 27017)
-db = client["dfreduce_vishwa_polarimetry"]
 
-coord = SkyCoord("06 05 05.7", "+23 23 39.0", unit=(u.hourangle, u.deg))
+# =============================================================================
+# Configuration
+# =============================================================================
 
-ra_deg = float(coord.ra.deg)
+MONGO_HOST = "localhost"
+MONGO_PORT = 27017
+DATABASE_NAME = "dfreduce_vishwa_polarimetry"
+TARGET_COLLECTION = "targets"
+
+TARGET_ID = "M51"
+RA_STRING = "13 29 52.34"
+DEC_STRING = "47 11 47.43"
+
+OBJECT_TYPE = "Galaxy"
+SURVEY = "standard"
+
+
+# =============================================================================
+# Coordinate conversion
+# =============================================================================
+
+coord = SkyCoord(RA_STRING, DEC_STRING, unit=(u.hourangle, u.deg))
+
+ra_deg_0_360 = float(coord.ra.deg)
 dec_deg = float(coord.dec.deg)
 
-# MongoDB GeoJSON expects longitude in [-180, 180]
-if ra_deg > 180:
-    ra_deg -= 360
+# MongoDB GeoJSON longitude should be in [-180, 180].
+ra_longitude = ra_deg_0_360 - 360.0 if ra_deg_0_360 > 180.0 else ra_deg_0_360
 
-db.targets.update_one(
-    {"_id": "SPST05"},
-    {
-        "$set": {
-            "coord": {
-                "type": "Point",
-                "coordinates": [ra_deg, dec_deg]
-            },
-            "survey": "standard"
-        }
+
+# =============================================================================
+# MongoDB upsert
+# =============================================================================
+
+client = MongoClient(MONGO_HOST, MONGO_PORT)
+db = client[DATABASE_NAME]
+targets = db[TARGET_COLLECTION]
+
+target_doc = {
+    "coord": {
+        "type": "Point",
+        "coordinates": [ra_longitude, dec_deg],
     },
-    upsert=True
+    "survey": SURVEY,
+    "object_type": OBJECT_TYPE,
+    "ra_deg": ra_deg_0_360,
+    "dec_deg": dec_deg,
+}
+
+result = targets.update_one(
+    {"_id": TARGET_ID},
+    {"$set": target_doc},
+    upsert=True,
 )
 
-print("SPST05 added/updated")
-print(f"Stored coord: [{ra_deg:.6f}, {dec_deg:.6f}]")
+client.close()
+
+
+# =============================================================================
+# Summary
+# =============================================================================
+
+if result.upserted_id is not None:
+    action = "added"
+elif result.modified_count > 0:
+    action = "updated"
+else:
+    action = "already up to date"
+
+print(f"{TARGET_ID} {action}")
+print(f"RA  0-360 deg: {ra_deg_0_360:.8f}")
+print(f"Dec deg     : {dec_deg:.8f}")
+print(f"Mongo coord : [{ra_longitude:.8f}, {dec_deg:.8f}]")
+print(f"GeoJSON type: Point")
+print(f"Object type : {OBJECT_TYPE}")

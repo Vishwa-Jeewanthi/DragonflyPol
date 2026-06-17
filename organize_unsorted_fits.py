@@ -1,5 +1,6 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
+from __future__ import print_function
 
 # =============================================================================
 # organize_unsorted_fits.py
@@ -28,8 +29,7 @@ from tqdm import tqdm
 from collections import defaultdict
 import csv
 from datetime import datetime, timedelta
-from pathlib import Path
-from zoneinfo import ZoneInfo
+import pytz
 
 # ----------------------------
 # CONFIG
@@ -41,7 +41,7 @@ DRY_RUN = True   # set False when ready to actually copy
 # DATE priority: DATE first, then DATE-OBS
 DATE_KEYS = ["DATE", "DATE-OBS"]
 
-FITS_EXTENSIONS = {".fits", ".fit", ".fts"}
+FITS_EXTENSIONS = set([".fits", ".fit", ".fts"])
 CAT_EXTENSION = ".cat"
 
 REPORT_FILE = os.path.join(BASE_PATH, "missing_cat_report.csv")
@@ -50,6 +50,55 @@ UNMATCHED_CAT_FILE = os.path.join(BASE_PATH, "unmatched_cat_files.csv")
 # ----------------------------
 # HELPERS
 # ----------------------------
+def get_file_suffix(path):
+    return os.path.splitext(path)[1]
+
+
+def get_file_stem(path):
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def parse_iso_datetime_python2(raw_value):
+    """
+    Python 2.7 replacement for datetime.fromisoformat() for the FITS-style
+    datetime strings used by this script.
+    """
+    value = str(raw_value).strip()
+    value = value.replace("Z", "")
+
+    # Original script only used fromisoformat when "T" was present.
+    date_part, time_part = value.split("T", 1)
+
+    # Ignore timezone offset text if present, matching the original behavior
+    # where replace(tzinfo=UTC) was applied after parsing.
+    plus_pos = time_part.find("+", 1)
+    minus_pos = time_part.find("-", 1)
+
+    cut_positions = []
+    if plus_pos != -1:
+        cut_positions.append(plus_pos)
+    if minus_pos != -1:
+        cut_positions.append(minus_pos)
+
+    if cut_positions:
+        time_part = time_part[:min(cut_positions)]
+
+    # Support HH:MM by adding seconds, similar to datetime.fromisoformat.
+    if len(time_part) == 5:
+        time_part = time_part + ":00"
+
+    # Support fractional seconds.
+    if "." in time_part:
+        main_time, frac = time_part.split(".", 1)
+        frac = frac[:6]
+        frac = frac + ("0" * (6 - len(frac)))
+        clean_value = date_part + " " + main_time + "." + frac
+        return datetime.strptime(clean_value, "%Y-%m-%d %H:%M:%S.%f")
+    else:
+        clean_value = date_part + " " + time_part
+        return datetime.strptime(clean_value, "%Y-%m-%d %H:%M:%S")
+
+
 def get_date_from_header(header):
     for key in DATE_KEYS:
         if key in header and header[key]:
@@ -58,14 +107,18 @@ def get_date_from_header(header):
             try:
                 # Parse UTC time
                 if "T" in raw_value:
-                    dt_utc = datetime.fromisoformat(raw_value.replace("Z", "")).replace(tzinfo=ZoneInfo("UTC"))
+                    dt_utc = parse_iso_datetime_python2(raw_value)
+                    dt_utc = pytz.utc.localize(dt_utc)
+
                 elif " " in raw_value:
-                    dt_utc = datetime.strptime(raw_value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("UTC"))
+                    dt_utc = datetime.strptime(raw_value, "%Y-%m-%d %H:%M:%S")
+                    dt_utc = pytz.utc.localize(dt_utc)
+
                 else:
                     return raw_value[:10]
 
                 # Convert to New Mexico local time
-                dt_local = dt_utc.astimezone(ZoneInfo("America/Denver"))
+                dt_local = dt_utc.astimezone(pytz.timezone("America/Denver"))
 
                 # Assign observing night
                 if dt_local.hour < 12:
@@ -88,16 +141,20 @@ def ensure_unique_destination(dest_path):
 
     i = 1
     while True:
-        new_dest = os.path.join(parent, f"{stem}_{i}{suffix}")
+        new_dest = os.path.join(parent, "{}_{}{}".format(stem, i, suffix))
         if not os.path.exists(new_dest):
             return new_dest
         i += 1
 
 
 def copy_file(src, dst):
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    dst_dir = os.path.dirname(dst)
+
+    if not os.path.exists(dst_dir):
+        os.makedirs(dst_dir)
+
     if DRY_RUN:
-        print(f"  DRY RUN (COPY): {os.path.basename(src)} -> {dst}")
+        print("  DRY RUN (COPY): {} -> {}".format(os.path.basename(src), dst))
     else:
         shutil.copy2(src, dst)
 
@@ -106,7 +163,7 @@ def copy_file(src, dst):
 # MAIN SORTER
 # ----------------------------
 def sort_camera_folder(camera_path):
-    print(f"\nProcessing {os.path.basename(camera_path)}")
+    print("\nProcessing {}".format(os.path.basename(camera_path)))
 
     missing_cat_rows = []
     unmatched_cat_rows = []
@@ -115,10 +172,10 @@ def sort_camera_folder(camera_path):
         source_folder = os.path.join(camera_path, subfolder_name)
 
         if not os.path.exists(source_folder):
-            print(f"  Skipping missing folder: {subfolder_name}")
+            print("  Skipping missing folder: {}".format(subfolder_name))
             continue
 
-        print(f"  Sorting inside {subfolder_name}")
+        print("  Sorting inside {}".format(subfolder_name))
 
         all_files = [
             os.path.join(source_folder, f)
@@ -127,36 +184,53 @@ def sort_camera_folder(camera_path):
         ]
 
         if not all_files:
-            print(f"  No files found in {subfolder_name}")
+            print("  No files found in {}".format(subfolder_name))
             continue
 
-        fits_files = [f for f in all_files if Path(f).suffix.lower() in FITS_EXTENSIONS]
-        cat_files = [f for f in all_files if Path(f).suffix.lower() == CAT_EXTENSION]
+        fits_files = [
+            f for f in all_files
+            if get_file_suffix(f).lower() in FITS_EXTENSIONS
+        ]
+
+        cat_files = [
+            f for f in all_files
+            if get_file_suffix(f).lower() == CAT_EXTENSION
+        ]
 
         stem_to_date = {}
         date_counts = defaultdict(lambda: {"fits": 0, "cat": 0})
 
         # ---------------- FITS ----------------
-        for fits_file in tqdm(fits_files, desc=f"{os.path.basename(camera_path)}/{subfolder_name} FITS"):
+        for fits_file in tqdm(
+            fits_files,
+            desc="{}/{} FITS".format(os.path.basename(camera_path), subfolder_name)
+        ):
             try:
                 header = fits.getheader(fits_file)
                 obs_date = get_date_from_header(header)
 
-                stem = Path(fits_file).stem
+                stem = get_file_stem(fits_file)
                 stem_to_date[stem] = obs_date
                 date_counts[obs_date]["fits"] += 1
 
                 target_dir = os.path.join(source_folder, obs_date)
-                dest = ensure_unique_destination(os.path.join(target_dir, os.path.basename(fits_file)))
+                dest = ensure_unique_destination(
+                    os.path.join(target_dir, os.path.basename(fits_file))
+                )
                 copy_file(fits_file, dest)
 
             except Exception as e:
-                print(f"  Error on FITS file {os.path.basename(fits_file)}: {e}")
+                print("  Error on FITS file {}: {}".format(
+                    os.path.basename(fits_file), e
+                ))
 
         # ---------------- CAT ----------------
-        for cat_file in tqdm(cat_files, desc=f"{os.path.basename(camera_path)}/{subfolder_name} CAT"):
+        for cat_file in tqdm(
+            cat_files,
+            desc="{}/{} CAT".format(os.path.basename(camera_path), subfolder_name)
+        ):
             try:
-                stem = Path(cat_file).stem
+                stem = get_file_stem(cat_file)
                 obs_date = stem_to_date.get(stem)
 
                 if obs_date is None:
@@ -170,11 +244,15 @@ def sort_camera_folder(camera_path):
                     date_counts[obs_date]["cat"] += 1
 
                 target_dir = os.path.join(source_folder, obs_date)
-                dest = ensure_unique_destination(os.path.join(target_dir, os.path.basename(cat_file)))
+                dest = ensure_unique_destination(
+                    os.path.join(target_dir, os.path.basename(cat_file))
+                )
                 copy_file(cat_file, dest)
 
             except Exception as e:
-                print(f"  Error on CAT file {os.path.basename(cat_file)}: {e}")
+                print("  Error on CAT file {}: {}".format(
+                    os.path.basename(cat_file), e
+                ))
 
         # ---------------- REPORT ----------------
         for date_key, counts in sorted(date_counts.items()):
@@ -205,7 +283,7 @@ def run_all_cameras():
         if os.path.isdir(os.path.join(BASE_PATH, d)) and d.startswith("Dragonfly")
     ]
 
-    print(f"Found {len(camera_folders)} camera folders")
+    print("Found {} camera folders".format(len(camera_folders)))
 
     all_missing = []
     all_unmatched = []
@@ -217,16 +295,23 @@ def run_all_cameras():
 
     # -------- SAVE CSV --------
     if all_missing:
-        with open(REPORT_FILE, "w", newline="") as f:
+        with open(REPORT_FILE, "wb") as f:
             writer = csv.DictWriter(
                 f,
-                fieldnames=["camera", "subfolder", "date", "fits_count", "cat_count", "missing_cat_count"]
+                fieldnames=[
+                    "camera",
+                    "subfolder",
+                    "date",
+                    "fits_count",
+                    "cat_count",
+                    "missing_cat_count"
+                ]
             )
             writer.writeheader()
             writer.writerows(all_missing)
 
     if all_unmatched:
-        with open(UNMATCHED_CAT_FILE, "w", newline="") as f:
+        with open(UNMATCHED_CAT_FILE, "wb") as f:
             writer = csv.DictWriter(
                 f,
                 fieldnames=["camera", "subfolder", "cat_file"]
@@ -240,12 +325,17 @@ def run_all_cameras():
     print("========================================\n")
 
     if all_missing:
-        print(f"Saved CSV report to: {REPORT_FILE}\n")
+        print("Saved CSV report to: {}\n".format(REPORT_FILE))
         for row in all_missing:
             print(
-                f"{row['camera']} | {row['subfolder']} | {row['date']} | "
-                f"FITS={row['fits_count']}  CAT={row['cat_count']}  "
-                f"MISSING={row['missing_cat_count']}"
+                "{} | {} | {} | FITS={}  CAT={}  MISSING={}".format(
+                    row["camera"],
+                    row["subfolder"],
+                    row["date"],
+                    row["fits_count"],
+                    row["cat_count"],
+                    row["missing_cat_count"]
+                )
             )
     else:
         print("No missing CAT files found.")
@@ -255,9 +345,13 @@ def run_all_cameras():
     print("========================================\n")
 
     if all_unmatched:
-        print(f"Saved unmatched CAT file list to: {UNMATCHED_CAT_FILE}\n")
+        print("Saved unmatched CAT file list to: {}\n".format(UNMATCHED_CAT_FILE))
         for row in all_unmatched:
-            print(f"{row['camera']} | {row['subfolder']} | {row['cat_file']}")
+            print("{} | {} | {}".format(
+                row["camera"],
+                row["subfolder"],
+                row["cat_file"]
+            ))
     else:
         print("No unmatched CAT files found.")
 
